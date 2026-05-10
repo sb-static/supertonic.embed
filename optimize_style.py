@@ -95,25 +95,35 @@ def _fix_clip(model: onnx.ModelProto) -> onnx.ModelProto:
     return model
 
 
+ONNX2TORCH_COMPAT_OPSET = 17
+
+
+def _cap_opset_for_onnx2torch(model: onnx.ModelProto) -> onnx.ModelProto:
+    """
+    onnx2torch resolves a node converter from the model-level ONNX opset.
+    Supertonic-3 assets, or onnxslim after processing them, may report opset
+    18/19.  onnx2torch does not register converters for several ops at those
+    schema versions (for example Reshape-19), even though the older converter
+    is semantically sufficient for these Supertonic graphs.
+
+    This is a compatibility shim, not an ONNX graph conversion: it only lowers
+    the advertised ai.onnx opset before calling onnx2torch, allowing the
+    registry to select its existing converters such as Reshape-14.
+    """
+    for opset in model.opset_import:
+        if opset.domain in ('', 'ai.onnx') and opset.version > ONNX2TORCH_COMPAT_OPSET:
+            opset.version = ONNX2TORCH_COMPAT_OPSET
+    return model
+
+
 def load_pt_model(name: str, onnx_dir: str = "onnx") -> torch.nn.Module:
-    """
-    Load an ONNX model, slim it, fix the opset version and convert
-    it into a PyTorch module.  Supertonic‑3 models require opset >= 18;
-    to remain compatible with older models we upgrade any version below
-    18 to 18.
-    """
-    # Slim unused weights to reduce memory footprint
-    slimmed = onnxslim.slim(os.path.join(onnx_dir, name))
-    # Upgrade opset version for the main domain (ai.onnx) to 18 if
-    # necessary【387035667251124†L70-L81】.
-    for opset in slimmed.opset_import:
-        if opset.domain == '' or opset.domain == 'ai.onnx':
-            if opset.version < 18:
-                opset.version = 18
-    # Remove empty Clip inputs for older exported models
-    _fix_clip(slimmed)
-    # Perform conversion using patched shape inference
+    """Load, slim, patch and convert an ONNX model to a frozen PyTorch module."""
     _patch_onnx2torch()
+
+    slimmed = onnxslim.slim(os.path.join(onnx_dir, name))
+    _cap_opset_for_onnx2torch(slimmed)
+    _fix_clip(slimmed)
+
     model = convert(slimmed)
     model.eval()
     for p in model.parameters():
@@ -296,7 +306,7 @@ def main() -> None:
         wav = wav.mean(axis=1)  # mix down to mono
     # Use torchaudio to resample if necessary
     if sr != 44100:
-        wav = librosa.resample(wav.astype(np.float32), sr, 44100)
+        wav = librosa.resample(wav.astype(np.float32), orig_sr=sr, target_sr=44100)
     target_wav = torch.tensor(wav, dtype=torch.float32).to(DEVICE)
 
     # Pre‑compute target WavLM features
@@ -321,7 +331,7 @@ def main() -> None:
     latent_mask = torch.tensor(latent_mask_np, dtype=torch.float32).to(DEVICE)
 
     # Determine initial style vectors
-    if reference_style is not None:
+    if reference_style is not None and reference_style != "auto":
         print(f"\nInitializing style from: {reference_style}")
         ref_style = load_voice_style(reference_style)
         style_ttl = torch.tensor(ref_style.ttl, dtype=torch.float32).to(DEVICE).clone().requires_grad_(True)
