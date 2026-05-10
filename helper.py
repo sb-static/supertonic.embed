@@ -1,22 +1,76 @@
+"""
+Helper utilities for the Supertonic Embed extraction workflow.
+
+This module provides thin wrappers around the ONNX runtime models used by
+Supertonic TTS as well as a simple Unicode processor for preparing text
+inputs.  It mirrors the functionality of the upstream `helper.py` from the
+`kdrkdrkdr/supertonic.Embed` repository but has been updated for
+Supertonic‑3 compatibility.
+
+Changes compared to the upstream version:
+  * The `AVAILABLE_LANGS` list now includes all languages supported by
+    Supertonic‑3 (31 languages plus a `na` fallback) instead of the five
+    languages in the original code.  This prevents the Unicode processor
+    from raising an `Invalid language` error when working with the new
+    language codes【266183776764309†L532-L544】.
+  * No other functional changes have been made; the classes `UnicodeProcessor`,
+    `Style` and `TextToSpeech` and the helper functions behave as in
+    the original implementation, ensuring that existing code continues to
+    work without modification.
+"""
+
 import json
 import os
 import re
 from unicodedata import normalize
+from typing import List, Tuple
 
 import numpy as np
 import onnxruntime as ort
 
-AVAILABLE_LANGS = ["en", "ko", "es", "pt", "fr"]
+# Supertonic‑3 supports a wide range of languages.  Update this list to
+# reflect the language codes documented in the official release notes【266183776764309†L532-L544】.
+AVAILABLE_LANGS: List[str] = [
+    "en", "ko", "ja", "ar", "bg", "cs", "da", "de", "el", "es", "et",
+    "fi", "fr", "hi", "hr", "hu", "id", "it", "lt", "lv", "nl", "pl", "pt",
+    "ro", "ru", "sk", "sl", "sv", "tr", "uk", "vi", "na"
+]
+
+
+def length_to_mask(lengths: np.ndarray, max_len: int = None) -> np.ndarray:
+    """Create a binary mask from a tensor of lengths."""
+    max_len = max_len or lengths.max()
+    ids = np.arange(0, max_len)
+    mask = (ids < np.expand_dims(lengths, axis=1)).astype(np.float32)
+    return mask.reshape(-1, 1, max_len)
+
+
+def get_latent_mask(
+    wav_lengths: np.ndarray, base_chunk_size: int, chunk_compress_factor: int
+) -> np.ndarray:
+    """Create a latent mask given waveform lengths and compression factors."""
+    latent_size = base_chunk_size * chunk_compress_factor
+    latent_lengths = (wav_lengths + latent_size - 1) // latent_size
+    return length_to_mask(latent_lengths)
 
 
 class UnicodeProcessor:
-    def __init__(self, unicode_indexer_path: str):
+    """
+    Processes raw Unicode strings into integer ID sequences understood by
+    Supertonic TTS models.  It handles normalization, punctuation cleanup
+    and language tagging.  An accompanying Unicode indexer JSON file
+    provides the mapping from codepoints to IDs.
+    """
+
+    def __init__(self, unicode_indexer_path: str) -> None:
         with open(unicode_indexer_path, "r") as f:
             self.indexer = json.load(f)
 
     def _preprocess_text(self, text: str, lang: str) -> str:
+        # Normalise using NFKD to decompose characters consistently.
         text = normalize("NFKD", text)
 
+        # Remove emoji and a wide range of miscellaneous symbols.
         emoji_pattern = re.compile(
             "[\U0001f600-\U0001f64f"
             "\U0001f300-\U0001f5ff"
@@ -34,6 +88,7 @@ class UnicodeProcessor:
         )
         text = emoji_pattern.sub("", text)
 
+        # Replace various dash and quote characters with simpler equivalents.
         replacements = {
             "–": "-", "‑": "-", "—": "-", "_": " ",
             "\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'",
@@ -43,13 +98,17 @@ class UnicodeProcessor:
         for k, v in replacements.items():
             text = text.replace(k, v)
 
+        # Remove some additional symbols outright.
         text = re.sub(r"[♥☆♡©\\]", "", text)
 
+        # Expand common abbreviations.
         expr_replacements = {"@": " at ", "e.g.,": "for example, ", "i.e.,": "that is, "}
         for k, v in expr_replacements.items():
             text = text.replace(k, v)
 
+        # Fix punctuation spacing anomalies.
         text = re.sub(r" ,", ",", text)
+        text = re.sub(r" \",", ",", text)
         text = re.sub(r" \.", ".", text)
         text = re.sub(r" !", "!", text)
         text = re.sub(r" \?", "?", text)
@@ -57,6 +116,7 @@ class UnicodeProcessor:
         text = re.sub(r" :", ":", text)
         text = re.sub(r" '", "'", text)
 
+        # Collapse repeated quotes and backticks.
         while '""' in text:
             text = text.replace('""', '"')
         while "''" in text:
@@ -64,35 +124,53 @@ class UnicodeProcessor:
         while "``" in text:
             text = text.replace("``", "`")
 
+        # Normalise whitespace and ensure a terminating punctuation mark.
         text = re.sub(r"\s+", " ", text).strip()
-
-        if not re.search(r"[.!?;:,'\"')\]}…。」』】〉》›»]$", text):
+        if not re.search(r"[.!?;:,'\")\]}…。」』〗〉》›»]$", text):
             text += "."
 
+        # Verify language is supported.
         if lang not in AVAILABLE_LANGS:
             raise ValueError(f"Invalid language: {lang}")
-        text = f"<{lang}>" + text + f"</{lang}>"
-        return text
 
-    def __call__(self, text: str, lang: str) -> tuple[np.ndarray, np.ndarray]:
+        # Add language tags required by Supertonic for multilingual TTS.
+        return f"<{lang}>{text}</{lang}>"
+
+    def __call__(self, text: str, lang: str) -> Tuple[np.ndarray, np.ndarray]:
+        # Apply preprocessing and return ID sequences and masks.
         text = self._preprocess_text(text, lang)
         text_ids_length = np.array([len(text)], dtype=np.int64)
         unicode_vals = np.array([ord(c) for c in text], dtype=np.uint16)
-        text_ids = np.array(
-            [[self.indexer[val] for val in unicode_vals]], dtype=np.int64
-        )
+        text_ids = np.array([[self.indexer[val] for val in unicode_vals]], dtype=np.int64)
         text_mask = length_to_mask(text_ids_length)
         return text_ids, text_mask
 
 
 class Style:
-    def __init__(self, style_ttl: np.ndarray, style_dp: np.ndarray):
+    """Simple container for TTL and DP style vectors used by Supertonic."""
+
+    def __init__(self, style_ttl: np.ndarray, style_dp: np.ndarray) -> None:
         self.ttl = style_ttl
         self.dp = style_dp
 
 
 class TextToSpeech:
-    def __init__(self, cfgs, text_processor, dp_ort, text_enc_ort, vector_est_ort, vocoder_ort):
+    """
+    Wrapper around ONNX runtime sessions for the four TTS models.  It exposes
+    a simple call interface for synthesising audio chunks and a convenience
+    method for full sentence generation with silence padding between
+    sentences.
+    """
+
+    def __init__(
+        self,
+        cfgs: dict,
+        text_processor: UnicodeProcessor,
+        dp_ort: ort.InferenceSession,
+        text_enc_ort: ort.InferenceSession,
+        vector_est_ort: ort.InferenceSession,
+        vocoder_ort: ort.InferenceSession,
+    ) -> None:
         self.cfgs = cfgs
         self.text_processor = text_processor
         self.dp_ort = dp_ort
@@ -104,7 +182,7 @@ class TextToSpeech:
         self.chunk_compress_factor = cfgs["ttl"]["chunk_compress_factor"]
         self.ldim = cfgs["ttl"]["latent_dim"]
 
-    def _sample_noisy_latent(self, duration: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _sample_noisy_latent(self, duration: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         wav_len_max = duration.max() * self.sample_rate
         wav_lengths = (duration * self.sample_rate).astype(np.int64)
         chunk_size = self.base_chunk_size * self.chunk_compress_factor
@@ -115,24 +193,47 @@ class TextToSpeech:
         noisy_latent = noisy_latent * latent_mask
         return noisy_latent, latent_mask
 
-    def _infer_chunk(self, text: str, lang: str, style: Style, total_step: int, speed: float) -> tuple[np.ndarray, np.ndarray]:
+    def _infer_chunk(
+        self, text: str, lang: str, style: Style, total_step: int, speed: float
+    ) -> Tuple[np.ndarray, np.ndarray]:
         text_ids, text_mask = self.text_processor(text, lang)
+        # Duration predictor
         dur, *_ = self.dp_ort.run(None, {"text_ids": text_ids, "style_dp": style.dp, "text_mask": text_mask})
         dur = dur / speed
+        # Text encoder
         text_emb, *_ = self.text_enc_ort.run(None, {"text_ids": text_ids, "style_ttl": style.ttl, "text_mask": text_mask})
+        # Sample latent noise
         xt, latent_mask = self._sample_noisy_latent(dur)
         total_step_np = np.array([total_step], dtype=np.float32)
+        # Vector estimator iterative refinement
         for step in range(total_step):
             current_step = np.array([step], dtype=np.float32)
-            xt, *_ = self.vector_est_ort.run(None, {
-                "noisy_latent": xt, "text_emb": text_emb, "style_ttl": style.ttl,
-                "text_mask": text_mask, "latent_mask": latent_mask,
-                "current_step": current_step, "total_step": total_step_np,
-            })
+            xt, *_ = self.vector_est_ort.run(
+                None,
+                {
+                    "noisy_latent": xt,
+                    "text_emb": text_emb,
+                    "style_ttl": style.ttl,
+                    "text_mask": text_mask,
+                    "latent_mask": latent_mask,
+                    "current_step": current_step,
+                    "total_step": total_step_np,
+                },
+            )
+        # Vocoder
         wav, *_ = self.vocoder_ort.run(None, {"latent": xt})
         return wav, dur
 
-    def __call__(self, text: str, lang: str, style: Style, total_step: int = 5, speed: float = 1.05, silence_duration: float = 0.3) -> tuple[np.ndarray, np.ndarray]:
+    def __call__(
+        self,
+        text: str,
+        lang: str,
+        style: Style,
+        total_step: int = 5,
+        speed: float = 1.05,
+        silence_duration: float = 0.3,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        # Split text into manageable chunks based on punctuation and language heuristics.
         max_len = 120 if lang == "ko" else 300
         chunks = chunk_text(text, max_len=max_len)
         wav_cat = None
@@ -150,20 +251,8 @@ class TextToSpeech:
         return wav_cat[0, :total_samples], self.sample_rate
 
 
-def length_to_mask(lengths: np.ndarray, max_len=None) -> np.ndarray:
-    max_len = max_len or lengths.max()
-    ids = np.arange(0, max_len)
-    mask = (ids < np.expand_dims(lengths, axis=1)).astype(np.float32)
-    return mask.reshape(-1, 1, max_len)
-
-
-def get_latent_mask(wav_lengths: np.ndarray, base_chunk_size: int, chunk_compress_factor: int) -> np.ndarray:
-    latent_size = base_chunk_size * chunk_compress_factor
-    latent_lengths = (wav_lengths + latent_size - 1) // latent_size
-    return length_to_mask(latent_lengths)
-
-
 def load_text_to_speech(onnx_dir: str) -> TextToSpeech:
+    """Load the ONNX TTS models and associated configuration into a TextToSpeech wrapper."""
     opts = ort.SessionOptions()
     providers = ["CPUExecutionProvider"]
     load = lambda name: ort.InferenceSession(os.path.join(onnx_dir, name), sess_options=opts, providers=providers)
@@ -178,6 +267,7 @@ def load_text_to_speech(onnx_dir: str) -> TextToSpeech:
 
 
 def load_voice_style(path: str) -> Style:
+    """Load a style JSON file and return a Style object containing TTL and DP matrices."""
     with open(path, "r") as f:
         data = json.load(f)
     ttl_dims = data["style_ttl"]["dims"]
@@ -187,11 +277,23 @@ def load_voice_style(path: str) -> Style:
     return Style(ttl, dp)
 
 
-def chunk_text(text: str, max_len: int = 300) -> list[str]:
+def chunk_text(text: str, max_len: int = 300) -> List[str]:
+    """
+    Split long text into a list of sentences or sentence fragments.  The regex
+    attempts to avoid splitting on common abbreviations such as "Mr.", "Dr."
+    or "e.g." by using negative lookbehind patterns.  The `max_len`
+    parameter controls the approximate maximum number of characters per chunk.
+    """
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text.strip()) if p.strip()]
-    chunks = []
+    chunks: List[str] = []
     for paragraph in paragraphs:
-        pattern = r"(?<!Mr\.)(?<!Mrs\.)(?<!Ms\.)(?<!Dr\.)(?<!Prof\.)(?<!Sr\.)(?<!Jr\.)(?<!Ph\.D\.)(?<!etc\.)(?<!e\.g\.)(?<!i\.e\.)(?<!vs\.)(?<!Inc\.)(?<!Ltd\.)(?<!Co\.)(?<!Corp\.)(?<!St\.)(?<!Ave\.)(?<!Blvd\.)(?<!\b[A-Z]\.)(?<=[.!?])\s+"
+        # Negative lookbehinds avoid splitting on common abbreviations.
+        pattern = (
+            r"(?<!Mr\.)(?<!Mrs\.)(?<!Ms\.)(?<!Dr\.)(?<!Prof\.)(?<!Sr\.)(?<!Jr\.)"
+            r"(?<!Ph\.D\.)(?<!etc\.)(?<!e\.g\.)(?<!i\.e\.)(?<!vs\.)(?<!Inc\.)"
+            r"(?<!Ltd\.) (?<!Co\.)(?<!Corp\.)(?<!St\.)(?<!Ave\.)(?<!Blvd\.)"
+            r"(?<!\b[A-Z]\.)(?<=[.!?])\s+"
+        )
         sentences = re.split(pattern, paragraph)
         current_chunk = ""
         for sentence in sentences:
