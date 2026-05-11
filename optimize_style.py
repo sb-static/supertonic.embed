@@ -1,37 +1,21 @@
 """
-Extract voice style JSON from a WAV file for Supertonic TTS (v3).
+Extract voice style JSON from a WAV file for SupertonicTTS.
 
-This script mirrors the upstream `optimize_style.py` from the
-`kdrkdrkdr/supertonic.Embed` repository but contains adjustments to
-accommodate Supertonic‑3 models:
-
-  * When converting the ONNX TTS models to PyTorch via
-    `onnx2torch`, the ONNX opset version is upgraded to at least 18.
-    Supertonic‑3 distributes its models with opset 18; leaving the
-    version at 17 (as in the original script) would result in
-    shape inference and conversion errors【387035667251124†L70-L81】.
-  * All other logic, including the layout of style vectors (TTL and
-    DP), WavLM feature matching and gradient‑based optimisation, is
-    preserved unchanged.  The style tensor dimensions remain
-    [1, 50, 256] for `style_ttl` and [1, 8, 16] for `style_dp` as these
-    are still valid for Supertonic‑3【423589999849011†L48-L74】【423589999849011†L274-L300】.
+Core approach:
+  - Convert ONNX TTS models to PyTorch (enables gradient backpropagation)
+  - Optimize style vectors via WavLM Layer 3 feature matching
+  - Layer selection based on Chiu et al. (2025) probing analysis
+  - Early stopping at same-speaker baseline threshold (0.24)
 
 Usage:
-    python optimize_style.py <config_name>
-
-Refer to the original upstream documentation for details on
-configuration JSON formats and examples.  Ensure that the ONNX models
-from Supertonic‑3 are placed in the `onnx/` subdirectory alongside
-`tts.json` and `unicode_indexer.json`.
+    python optimize_style.py ljs         # uses configs/ljs.json
+    python optimize_style.py zhongli     # uses configs/zhongli.json
 """
 
 import json
 import os
 import sys
 import glob
-from datetime import datetime
-from typing import List, Tuple, Optional
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -46,117 +30,72 @@ from onnx2torch import convert
 
 from helper import load_text_to_speech, load_voice_style
 
-# SSL certificate workaround: some environments may have invalid CA bundles.
+# SSL certificate workaround
 os.environ.pop('SSL_CERT_FILE', None)
 os.environ.pop('CURL_CA_BUNDLE', None)
 os.environ.pop('REQUESTS_CA_BUNDLE', None)
-import httpx  # noqa: E402
-
-# Disable SSL verification globally for httpx.  This mirrors the upstream
-# behaviour; see the original script for rationale.  It is safe
-# here because we only download models from trusted endpoints.
+import httpx
 _orig_client = httpx.Client
 class _NoVerifyClient(_orig_client):
     def __init__(self, *args, **kwargs):
         kwargs['verify'] = False
         super().__init__(*args, **kwargs)
-httpx.Client = _NoVerifyClient  # type: ignore
+httpx.Client = _NoVerifyClient
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ===== ONNX to PyTorch conversion =====
 
-def _patch_onnx2torch() -> None:
-    """
-    Bypass onnx2torch's safe_shape_inference which writes temporary files.
-    We inline shape inference here to avoid file system side effects.
-    """
-
+def _patch_onnx2torch():
+    """Bypass onnx2torch's safe_shape_inference which writes temp files."""
     def patched(m):
         if isinstance(m, str):
             m = onnx.load(m)
         try:
             return shape_inference.infer_shapes(m)
-        except Exception:
+        except:
             return m
     onnx2torch.converter.safe_shape_inference = patched
 
-
-def _fix_clip(model: onnx.ModelProto) -> onnx.ModelProto:
+def _fix_clip(model):
     """Remove empty Clip inputs that cause onnx2torch conversion errors."""
     for node in model.graph.node:
         if node.op_type == 'Clip':
-            inputs: List[str] = list(node.input)
+            inputs = list(node.input)
             while inputs and inputs[-1] == '':
                 inputs.pop()
             del node.input[:]
             node.input.extend(inputs)
     return model
 
-
-ONNX2TORCH_COMPAT_OPSET = 17
-
-
-def _cap_opset_for_onnx2torch(model: onnx.ModelProto) -> onnx.ModelProto:
-    """
-    onnx2torch resolves a node converter from the model-level ONNX opset.
-    Supertonic-3 assets, or onnxslim after processing them, may report opset
-    18/19.  onnx2torch does not register converters for several ops at those
-    schema versions (for example Reshape-19), even though the older converter
-    is semantically sufficient for these Supertonic graphs.
-
-    This is a compatibility shim, not an ONNX graph conversion: it only lowers
-    the advertised ai.onnx opset before calling onnx2torch, allowing the
-    registry to select its existing converters such as Reshape-14.
-    """
-    for opset in model.opset_import:
-        if opset.domain in ('', 'ai.onnx') and opset.version > ONNX2TORCH_COMPAT_OPSET:
-            opset.version = ONNX2TORCH_COMPAT_OPSET
-    return model
-
-
-def load_pt_model(name: str, onnx_dir: str = "onnx") -> torch.nn.Module:
-    """Load, slim, patch and convert an ONNX model to a frozen PyTorch module."""
-    _patch_onnx2torch()
-
+def load_pt_model(name, onnx_dir="onnx"):
+    """Load ONNX model, slim it, fix opset, and convert to PyTorch."""
     slimmed = onnxslim.slim(os.path.join(onnx_dir, name))
-    _cap_opset_for_onnx2torch(slimmed)
+    for opset in slimmed.opset_import:
+        if opset.domain == '' or opset.domain == 'ai.onnx':
+            opset.version = 17
     _fix_clip(slimmed)
-
-    model = convert(slimmed)
-    model.eval()
-    for p in model.parameters():
+    m = convert(slimmed)
+    m.eval()
+    for p in m.parameters():
         p.requires_grad_(False)
-    return model.to(DEVICE)
-
+    return m.to(DEVICE)
 
 # ===== WavLM perceptual loss =====
 
-def load_wavlm() -> torch.nn.Module:
-    """
-    Load WavLM‑Large from the HuggingFace Transformers library.  According
-    to Chiu et al. (2025), layer 3 best encodes speaker identity.  The
-    model is moved to the appropriate device and set to eval mode.  All
-    parameters have gradients disabled.
-    """
-    from transformers import WavLMModel  # type: ignore
+def load_wavlm():
+    """Load WavLM-Large. Layer 3 best encodes speaker identity (Chiu et al. 2025)."""
+    from transformers import WavLMModel
     model = WavLMModel.from_pretrained('microsoft/wavlm-large').to(DEVICE).eval()
     for p in model.parameters():
         p.requires_grad_(False)
     return model
 
-
-def wavlm_feature_loss(
-    wavlm: torch.nn.Module,
-    gen_wav: torch.Tensor,
-    target_features: Tuple[torch.Tensor, torch.Tensor],
-    layer: int = 3,
-) -> torch.Tensor:
+def wavlm_feature_loss(wavlm, gen_wav, target_features, layer=3):
     """
-    Compute perceptual loss between generated and target audio using
-    statistics of WavLM hidden states.  The time‑averaged mean and
-    standard deviation capture speaker identity independent of content.
+    Compare WavLM Layer 3 features between generated and target audio.
+    Time-averaged mean and std capture speaker identity independent of content.
     """
     if gen_wav.ndim == 1:
         gen_wav = gen_wav.unsqueeze(0)
@@ -169,49 +108,29 @@ def wavlm_feature_loss(
     gen_mean = gen_feat.mean(dim=1)
     gen_std = gen_feat.std(dim=1)
 
-    return F.mse_loss(gen_mean, tgt_mean) + F.mse_loss(gen_std, tgt_std)
+    loss = F.mse_loss(gen_mean, tgt_mean) + F.mse_loss(gen_std, tgt_std)
+    return loss
 
-
-def extract_wavlm_targets(
-    wavlm: torch.nn.Module, target_wav: torch.Tensor, layer: int = 3
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Pre‑compute WavLM hidden state statistics for a target audio tensor.
-    Returns the mean and standard deviation of the selected layer.
-    """
+def extract_wavlm_targets(wavlm, target_wav, layer=3):
+    """Pre-compute WavLM Layer 3 feature statistics from target WAV."""
     if target_wav.ndim == 1:
         target_wav = target_wav.unsqueeze(0)
     wav_16k = torchaudio.functional.resample(target_wav, 44100, 16000)
+
     with torch.no_grad():
         out = wavlm(wav_16k, output_hidden_states=True)
+
     feat = out.hidden_states[layer]
     mean = feat.mean(dim=1)
     std = feat.std(dim=1)
     return (mean, std)
 
+# ===== TTS forward pass =====
 
-# ===== Differentiable TTS forward pass =====
-
-def tts_forward(
-    text_ids: torch.Tensor,
-    text_mask: torch.Tensor,
-    style_ttl: torch.Tensor,
-    style_dp: torch.Tensor,
-    dp_model: torch.nn.Module,
-    te_model: torch.nn.Module,
-    ve_model: torch.nn.Module,
-    voc_model: torch.nn.Module,
-    total_step: int,
-    speed: float,
-    noisy_latent: torch.Tensor,
-    latent_mask: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Perform a forward pass through the differentiable TTS pipeline.  This
-    consists of running the duration predictor, text encoder, vector
-    estimator (iteratively) and vocoder to produce a waveform given a
-    pair of style tensors and a sampled latent noise tensor.
-    """
+def tts_forward(text_ids, text_mask, style_ttl, style_dp,
+                dp_model, te_model, ve_model, voc_model,
+                total_step, speed, noisy_latent, latent_mask):
+    """Differentiable TTS forward pass through all 4 models."""
     dur = dp_model(text_ids, style_dp, text_mask)
     dur = dur / speed
     text_emb = te_model(text_ids, style_ttl, text_mask)
@@ -223,160 +142,194 @@ def tts_forward(
     wav = voc_model(xt)
     return wav, dur
 
+# ===== Save style JSON =====
 
-# ===== Style saving =====
-
-def save_style(
-    path: str,
-    style_ttl: torch.Tensor,
-    style_dp: torch.Tensor,
-    source_file: Optional[str] = None,
-) -> None:
-    """
-    Persist style vectors to disk in SupertonicTTS‑compatible JSON format.
-    The shapes [1, 50, 256] and [1, 8, 16] are hard‑coded here because
-    Supertonic‑3 retains the same style dimensions as previous versions【423589999849011†L48-L74】【423589999849011†L274-L300】.
-    """
+def save_style(path, style_ttl, style_dp, source_file=None):
+    """Save style vectors in SupertonicTTS-compatible JSON format."""
+    from datetime import datetime
     style_json = {
         "style_ttl": {
             "data": style_ttl.cpu().numpy().tolist(),
             "dims": [1, 50, 256],
-            "type": "float32",
+            "type": "float32"
         },
         "style_dp": {
             "data": style_dp.cpu().numpy().tolist(),
             "dims": [1, 8, 16],
-            "type": "float32",
+            "type": "float32"
         },
         "metadata": {
             "source_file": source_file or "unknown",
             "source_sample_rate": 44100,
             "target_sample_rate": 44100,
-            "extracted_at": datetime.now().isoformat(),
-        },
+            "extracted_at": datetime.now().isoformat()
+        }
     }
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(style_json, f)
 
+# ===== Main =====
 
-# ===== Main optimisation loop =====
+def main():
+    _patch_onnx2torch()
 
-def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: python optimize_style.py <config_name>")
+    # Load config
+    arg = sys.argv[1] if len(sys.argv) > 1 else "ljs"
+    if os.path.exists(arg):
+        config_path = arg
+    elif os.path.exists(f"configs/{arg}.json"):
+        config_path = f"configs/{arg}.json"
+    elif os.path.exists(f"configs/{arg}"):
+        config_path = f"configs/{arg}"
+    else:
+        print(f"Config not found: {arg}")
         sys.exit(1)
-    config_name = sys.argv[1]
-    config_path = os.path.join("configs", f"{config_name}.json")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    with open(config_path, "r") as f:
-        config = json.load(f)
 
-    # Load reference WAV and configuration parameters
-    target_wav_path: str = config["target_wav"]
-    total_step: int = config.get("total_step", 5)
-    speed: float = config.get("speed", 1.05)
-    lr: float = config.get("lr", 1e-2)
-    num_steps: int = config.get("num_steps", 500)
-    threshold: float = config.get("threshold", 0.24)
-    save_every: int = config.get("save_every", 100)
-    start_step: int = config.get("start_step", 0)
-    log_dir: str = config.get("log_dir", "logs")
-    reference_style: Optional[str] = config.get("reference_style")
+    print(f"Loading config: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
 
-    # Ensure logging directory exists
+    name = cfg["name"]
+    target_wav_path = cfg["target_wav"]
+    reference_style = cfg.get("reference_style")
+    seed = cfg.get("seed", 42)
+    lr = cfg.get("lr", 2e-4)
+    num_steps = cfg.get("num_steps", 3000)
+    total_step = cfg.get("total_step", 5)
+    speed = cfg.get("speed", 1.05)
+    save_every = cfg.get("save_every", 100)
+    threshold = cfg.get("early_stop_loss_threshold", 0.20)
+
+    # Texts for multi-text rotation
+    opt_texts = [
+        "Привет! Добро пожаловать в первый искусственно интеллектуальный офис Сбера. Давайте знакомиться!",
+        "Но я общаюсь не только со взрослыми! Я всегда рада нашим самым юным гостям.",
+        "Я постоянно учусь новому и всегда готова к работе. Скажите, чем я могу помочь вам прямо сейчас?",
+        "Особенно я люблю работать с теми, кто только начинает свой путь в бизнесе.",
+        "А еще я умею работать полностью самостоятельно. Например, если вам нужна дебетовая карта, я могу провести для вас полную, автономную консультацию — от выбора дизайна до оформления.",
+    ]
+    opt_lang = "ru"
+
+    # Paths
+    output_json = f"voice_styles/{name}.json"
+    log_dir = f"logs/{name}"
     os.makedirs(log_dir, exist_ok=True)
 
-    print("=== Loading models ===")
-    # Load ONNX models via helper; this uses the CPU provider by default
-    tts = load_text_to_speech("onnx")
-    # Convert ONNX models to differentiable PyTorch modules
+
+    # Save config to log dir
+    with open(os.path.join(log_dir, "train_config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=4)
+
+    # Find latest checkpoint for auto-resume
+    def find_latest_checkpoint():
+        pattern = os.path.join(log_dir, f"{name}_*.json")
+        files = [f for f in glob.glob(pattern) if "train_config" not in f]
+        if not files:
+            return None, 0
+        latest = max(files, key=lambda f: int(os.path.splitext(os.path.basename(f))[0].split("_")[-1]))
+        step_num = int(os.path.splitext(os.path.basename(latest))[0].split("_")[-1])
+        return latest, step_num
+
+    # latest_ckpt, start_step = find_latest_checkpoint()
+    latest_ckpt = None
+    start_step = 0
+
+    print(f"Using device: {DEVICE}")
+    print(f"Name: {name}")
+
+    # ===== 1. Load target WAV and extract WavLM features =====
+    print(f"\nLoading target WAV: {target_wav_path}")
+    target_wav, _ = librosa.load(target_wav_path, sr=44100)
+    target_wav_t = torch.tensor(target_wav, dtype=torch.float32).to(DEVICE)
+    print(f"  Duration: {len(target_wav)/44100:.2f}s")
+
+    print("\nLoading WavLM-Large...")
+    wavlm = load_wavlm()
+    print("  WavLM loaded.")
+
+    print("Extracting target features (Layer 3)...")
+    target_feats = extract_wavlm_targets(wavlm, target_wav_t)
+    print("  Done.")
+
+    # ===== 2. Load TTS models (ONNX -> PyTorch) =====
+    print("\nConverting ONNX models to PyTorch...")
     dp_model = load_pt_model("duration_predictor.onnx")
     te_model = load_pt_model("text_encoder.onnx")
     ve_model = load_pt_model("vector_estimator.onnx")
     voc_model = load_pt_model("vocoder.onnx")
+    print("  All models converted.")
 
-    # Load WavLM for perceptual loss
-    wavlm = load_wavlm()
+    # ===== 3. Preprocess texts =====
+    tts = load_text_to_speech("onnx")
+    text_inputs = []
+    for text in opt_texts:
+        ids_np, mask_np = tts.text_processor(text, opt_lang)
+        text_inputs.append((
+            torch.tensor(ids_np, dtype=torch.long).to(DEVICE),
+            torch.tensor(mask_np, dtype=torch.float32).to(DEVICE)
+        ))
 
-    # Read target WAV file at its native sample rate and resample to 44.1 kHz
-    wav, sr = sf.read(target_wav_path)
-    if wav.ndim > 1:
-        wav = wav.mean(axis=1)  # mix down to mono
-    # Use torchaudio to resample if necessary
-    if sr != 44100:
-        wav = librosa.resample(wav.astype(np.float32), orig_sr=sr, target_sr=44100)
-    target_wav = torch.tensor(wav, dtype=torch.float32).to(DEVICE)
+    # ===== 4. Generate fixed noisy latent (seed-controlled) =====
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    tmp_style = load_voice_style("voice_styles/M1.json")
+    tmp_dp = torch.tensor(tmp_style.dp, dtype=torch.float32).to(DEVICE)
+    with torch.no_grad():
+        init_dur = dp_model(text_inputs[0][0], tmp_dp, text_inputs[0][1]) / speed
+    dur_val = init_dur.item()
+    wav_len = int(dur_val * 44100)
+    chunk_size = tts.base_chunk_size * tts.chunk_compress_factor
+    latent_len = int(np.ceil(wav_len / chunk_size))
+    latent_dim = tts.ldim * tts.chunk_compress_factor
+    noisy_latent_fixed = torch.tensor(np.random.randn(1, latent_dim, latent_len).astype(np.float32)).to(DEVICE)
+    latent_mask = torch.ones(1, 1, latent_len, dtype=torch.float32).to(DEVICE)
+    del tmp_style, tmp_dp
 
-    # Pre‑compute target WavLM features
-    target_feats = extract_wavlm_targets(wavlm, target_wav, layer=3)
-
-    # Prepare text inputs for gradient descent; use default prompts if not specified
-    texts: List[str] = config.get("texts", ["Testing style extraction."])
-    langs: List[str] = config.get("langs", ["en"] * len(texts))
-    if len(langs) != len(texts):
-        raise ValueError("Length of 'langs' must match length of 'texts'")
-
-    text_inputs: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    for text, lang in zip(texts, langs):
-        # Use ONNX TTS text processor to get IDs and masks
-        ids, mask = tts.text_processor(text, lang)
-        text_inputs.append((torch.tensor(ids, dtype=torch.long).to(DEVICE), torch.tensor(mask, dtype=torch.float32).to(DEVICE)))
-
-    # Sample a fixed latent noise tensor for reproducible optimisation
-    duration_dummy = torch.ones(1, dtype=torch.float32)
-    noisy_latent_np, latent_mask_np = tts._sample_noisy_latent(duration_dummy.cpu().numpy())
-    noisy_latent = torch.tensor(noisy_latent_np, dtype=torch.float32).to(DEVICE)
-    latent_mask = torch.tensor(latent_mask_np, dtype=torch.float32).to(DEVICE)
-
-    # Determine initial style vectors
-    if reference_style is not None and reference_style != "auto":
-        print(f"\nInitializing style from: {reference_style}")
-        ref_style = load_voice_style(reference_style)
+    # ===== 5. Initialize style vectors =====
+    if latest_ckpt:
+        print(f"\nResuming from: {latest_ckpt} (step {start_step})")
+        ref_style = load_voice_style(latest_ckpt)
         style_ttl = torch.tensor(ref_style.ttl, dtype=torch.float32).to(DEVICE).clone().requires_grad_(True)
         style_dp = torch.tensor(ref_style.dp, dtype=torch.float32).to(DEVICE).clone()
-    else:
-        # Choose the best existing style from the voice_styles directory by comparing WavLM features
-        print("\nSearching for the closest pre‑existing style in 'voice_styles/'...")
+    elif reference_style == "auto":
+        # Auto-select closest preset via WavLM Layer 3 distance
+        print("\nFinding closest style to target WAV (WavLM Layer 3)...")
         all_style_paths = sorted(glob.glob("voice_styles/[FM]*.json"))
-        best_dist: float = float('inf')
-        best_path: Optional[str] = None
-        # Reuse fixed latent noise and text inputs for quick comparison
+        best_dist = float('inf')
+        best_path = None
         for sp in all_style_paths:
             s = load_voice_style(sp)
             s_ttl = torch.tensor(s.ttl, dtype=torch.float32).to(DEVICE)
             s_dp = torch.tensor(s.dp, dtype=torch.float32).to(DEVICE)
             with torch.no_grad():
                 test_wav, _ = tts_forward(
-                    text_inputs[0][0],
-                    text_inputs[0][1],
-                    s_ttl,
-                    s_dp,
-                    dp_model,
-                    te_model,
-                    ve_model,
-                    voc_model,
-                    total_step,
-                    speed,
-                    noisy_latent,
-                    latent_mask,
+                    text_inputs[0][0], text_inputs[0][1], s_ttl, s_dp,
+                    dp_model, te_model, ve_model, voc_model,
+                    total_step, speed, noisy_latent_fixed, latent_mask,
                 )
                 dist = wavlm_feature_loss(wavlm, test_wav.squeeze(), target_feats).item()
             print(f"  {os.path.basename(sp)}: {dist:.4f}")
             if dist < best_dist:
                 best_dist = dist
                 best_path = sp
-        if best_path is None:
-            raise RuntimeError("No pre‑existing styles found in 'voice_styles/'")
         print(f"  >> Best: {os.path.basename(best_path)} (dist={best_dist:.4f})")
         ref_style = load_voice_style(best_path)
         style_ttl = torch.tensor(ref_style.ttl, dtype=torch.float32).to(DEVICE).clone().requires_grad_(True)
         style_dp = torch.tensor(ref_style.dp, dtype=torch.float32).to(DEVICE).clone()
+    elif reference_style:
+        print(f"\nInitializing style from: {reference_style}")
+        ref_style = load_voice_style(reference_style)
+        style_ttl = torch.tensor(ref_style.ttl, dtype=torch.float32).to(DEVICE).clone().requires_grad_(True)
+        style_dp = torch.tensor(ref_style.dp, dtype=torch.float32).to(DEVICE).clone()
+    else:
+        print("\nInitializing style randomly (not recommended)")
+        style_ttl = (torch.randn(1, 50, 256) * 0.1).to(DEVICE).requires_grad_(True)
+        style_dp = torch.tensor(load_voice_style("voice_styles/M1.json").dp, dtype=torch.float32).to(DEVICE).clone()
 
-    print(f"  style_ttl: {tuple(style_ttl.shape)}, style_dp: {tuple(style_dp.shape)} (dp frozen)")
+    print(f"  style_ttl: {style_ttl.shape}, style_dp: {style_dp.shape} (dp frozen)")
 
-    # ===== Optimisation setup =====
+    # ===== 6. Optimization (style_ttl only, style_dp frozen) =====
     optimizer = torch.optim.Adam([style_ttl], lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, patience=200, factor=0.5, min_lr=lr * 0.01
@@ -387,75 +340,66 @@ def main() -> None:
         print(f"\nAlready reached target step ({end_step}). Nothing to do.")
         return
 
-    print(f"\nStarting optimisation (step {start_step + 1} -> {end_step}, early stop at {threshold})...")
-    start_time = torch.cuda.Event(enable_timing=True) if DEVICE.type == 'cuda' else None
-    if start_time is not None:
-        end_time = torch.cuda.Event(enable_timing=True)
-        start_time.record()
+    import time
+    start_time = time.time()
+    print(f"\nStarting optimization (step {start_step+1} -> {end_step}, early stop at {threshold})...")
 
-    best_loss: float = float('inf')
-    best_ttl: Optional[torch.Tensor] = None
+    best_loss = float('inf')
+    best_ttl = None
     best_dp = style_dp.detach().clone()
 
-    # Optimisation loop
     for step in range(start_step, end_step):
         optimizer.zero_grad()
-        # Rotate through provided texts to encourage robustness
+
+        # Rotate through texts each step
         text_idx = step % len(text_inputs)
         text_ids, text_mask = text_inputs[text_idx]
+
         # Forward pass
         wav_out, _ = tts_forward(
-            text_ids,
-            text_mask,
-            style_ttl,
-            style_dp,
-            dp_model,
-            te_model,
-            ve_model,
-            voc_model,
-            total_step,
-            speed,
-            noisy_latent,
-            latent_mask,
+            text_ids, text_mask, style_ttl, style_dp,
+            dp_model, te_model, ve_model, voc_model,
+            total_step, speed, noisy_latent_fixed, latent_mask,
         )
         gen_wav = wav_out.squeeze()
-        # Compute perceptual loss
+
+        # Compute loss
         loss = wavlm_feature_loss(wavlm, gen_wav, target_feats)
-        # Backpropagate and update style_ttl
+
+        # Backward + update
         loss.backward()
         torch.nn.utils.clip_grad_norm_([style_ttl], max_norm=1.0)
         optimizer.step()
         scheduler.step(loss)
-        # Track best loss and style_ttl
+
+        # Track best
         if loss.item() < best_loss:
             best_loss = loss.item()
             best_ttl = style_ttl.detach().clone()
-        # Logging
+
+        # Log
         if (step + 1) % 10 == 0:
             current_lr = optimizer.param_groups[0]['lr']
-            print(f"  Step {step + 1}/{end_step} | Loss: {loss.item():.4f} | LR: {current_lr:.4f} | Best: {best_loss:.4f}")
-        # Save intermediate checkpoints
+            print(f"  Step {step+1}/{end_step} | Loss: {loss.item():.4f} | LR: {current_lr:.4f} | Best: {best_loss:.4f}")
+
+        # Save checkpoint
         if (step + 1) % save_every == 0:
-            ckpt_path = os.path.join(log_dir, f"{config_name}_{step + 1:04d}.json")
+            ckpt_path = f"{log_dir}/{name}_{step+1:04d}.json"
             save_style(ckpt_path, best_ttl, best_dp, target_wav_path)
             print(f"  >> Checkpoint saved: {ckpt_path}")
+
         # Early stopping
         if best_loss <= threshold:
-            print(f"  Early stop at step {step + 1}: best loss {best_loss:.4f} <= {threshold}")
+            print(f"  Early stop at step {step+1}: best loss {best_loss:.4f} <= {threshold}")
             break
 
-    # ===== Save final result =====
-    final_path = os.path.join(log_dir, f"{config_name}_final.json")
+    # ===== 7. Save final result =====
+    final_path = f"{log_dir}/{name}_final.json"
     print(f"\nSaving best style to: {final_path}")
     save_style(final_path, best_ttl, best_dp, target_wav_path)
-    # Timing information
-    if start_time is not None:
-        end_time.record()
-        torch.cuda.synchronize()
-        elapsed = start_time.elapsed_time(end_time) / 1000.0  # seconds
-        print(f"  Done! Best loss: {best_loss:.4f} | Time: {elapsed:.1f}s ({elapsed / 60:.1f}min)")
-    else:
-        print(f"  Done! Best loss: {best_loss:.4f}")
+    elapsed = time.time() - start_time
+    print(f"  Done! Best loss: {best_loss:.4f} | Time: {elapsed:.1f}s ({elapsed/60:.1f}min)")
+
 
 
 if __name__ == "__main__":
